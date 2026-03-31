@@ -19,10 +19,7 @@ AUBURN_WHITE  = "#FFFFFF"
 
 st.markdown(f"""
 <style>
-  /* Global background */
   .stApp {{ background-color: #f5f5f5; }}
-
-  /* Sidebar */
   [data-testid="stSidebar"] {{
       background-color: {AUBURN_NAVY};
   }}
@@ -33,8 +30,6 @@ st.markdown(f"""
   [data-testid="stSidebar"] .stTextInput label {{
       color: {AUBURN_WHITE} !important;
   }}
-
-  /* Top header bar */
   .auburn-header {{
       background: linear-gradient(90deg, {AUBURN_NAVY} 0%, #05336B 100%);
       color: {AUBURN_WHITE};
@@ -56,8 +51,6 @@ st.markdown(f"""
       font-size: 0.9rem;
       color: #ccc;
   }}
-
-  /* Metric cards */
   .metric-card {{
       background: {AUBURN_WHITE};
       border-left: 4px solid {AUBURN_ORANGE};
@@ -68,8 +61,6 @@ st.markdown(f"""
   }}
   .metric-label {{ font-size: 0.78rem; color: #666; text-transform: uppercase; letter-spacing: 0.05em; }}
   .metric-value {{ font-size: 1.6rem; font-weight: 700; color: {AUBURN_NAVY}; margin-top: 2px; }}
-
-  /* Section headers */
   .section-header {{
       color: {AUBURN_NAVY};
       font-weight: 700;
@@ -78,8 +69,6 @@ st.markdown(f"""
       padding-bottom: 6px;
       margin: 20px 0 12px;
   }}
-
-  /* Tab styling */
   .stTabs [data-baseweb="tab-list"] {{
       background: {AUBURN_NAVY};
       border-radius: 8px 8px 0 0;
@@ -93,11 +82,7 @@ st.markdown(f"""
       background: {AUBURN_ORANGE} !important;
       color: {AUBURN_WHITE} !important;
   }}
-
-  /* Dataframe tweaks */
   .stDataFrame {{ border-radius: 6px; overflow: hidden; }}
-
-  /* Buttons */
   .stButton > button {{
       background: {AUBURN_ORANGE};
       color: {AUBURN_WHITE};
@@ -131,11 +116,39 @@ def load_data():
     pitcher_game_log = _read("pitcher_game_log.csv")
     batter_game_log  = _read("batter_game_log.csv")
 
-    # Normalise game date to string for sorting
+    # Normalise game date and extract season year
     for df in [pitcher_game_log, batter_game_log]:
         df["GameDate"] = df["GameDate"].astype(str)
+        df["Season"] = df["GameDate"].str[:4]
 
     return pitcher_stats, batter_stats, pitcher_game_log, batter_game_log
+
+
+def build_pitcher_stats_from_log(game_log):
+    """Aggregate pitcher season stats from the game log (used for per-season filtering)."""
+    agg = game_log.groupby(["Pitcher", "PitcherTeam"]).agg(
+        TotalPitches=("Pitches", "sum"),
+        AvgVelocity=("AvgVelo", "mean"),
+        Strikeouts=("Strikeouts", "sum"),
+        Walks=("Walks", "sum"),
+        HitsAllowed=("HitsAllowed", "sum"),
+    ).reset_index()
+    agg["AvgVelocity"] = agg["AvgVelocity"].round(1)
+    return agg
+
+
+def build_batter_stats_from_log(game_log):
+    """Aggregate batter season stats from the game log (used for per-season filtering)."""
+    agg_cols = {c: "sum" for c in ["Pitches", "Hits", "HomeRuns", "Strikeouts", "Walks"]
+                if c in game_log.columns}
+    if "AvgExitVelo" in game_log.columns:
+        agg_cols["AvgExitVelo"] = "mean"
+    agg = game_log.groupby(["Batter", "BatterTeam"]).agg(
+        **{k if k != "Pitches" else "TotalPitches": (k, v) for k, v in agg_cols.items()}
+    ).reset_index()
+    if "AvgExitVelo" in agg.columns:
+        agg["AvgExitVelo"] = agg["AvgExitVelo"].round(1)
+    return agg
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -143,6 +156,10 @@ with st.sidebar:
     st.markdown("## ⚾ Auburn Baseball")
     st.markdown("---")
     view = st.radio("View", ["📊 Season Leaderboards", "🔎 Player Profile"])
+    st.markdown("---")
+
+    season = st.selectbox("Season", ["All", "2026", "2025"], index=0)
+
     st.markdown("---")
     role = st.radio("Filter by role", ["All", "Pitchers", "Batters"])
     st.markdown("---")
@@ -158,11 +175,12 @@ with st.sidebar:
     )
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("""
+season_label = season if season != "All" else "2025 + 2026"
+st.markdown(f"""
 <div class="auburn-header">
   <div>
     <h1>⚾ Auburn Baseball Analytics</h1>
-    <p>Trackman pitch-by-pitch data · Season statistics</p>
+    <p>Trackman pitch-by-pitch data · Season: {season_label}</p>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -174,6 +192,20 @@ except Exception as e:
     st.error(f"Could not load data: {e}")
     st.info("Make sure the AZURE_STORAGE_CONNECTION_STRING environment variable is set and the transform has been run.")
     st.stop()
+
+# ── Apply season filter ───────────────────────────────────────────────────────
+if season != "All":
+    p_log_filtered = pitcher_game_log[pitcher_game_log["Season"] == season]
+    b_log_filtered = batter_game_log[batter_game_log["Season"] == season]
+    # Re-aggregate stats for the selected season from the game logs
+    pitcher_stats_view = build_pitcher_stats_from_log(p_log_filtered)
+    batter_stats_view  = build_batter_stats_from_log(b_log_filtered)
+else:
+    p_log_filtered     = pitcher_game_log
+    b_log_filtered     = batter_game_log
+    pitcher_stats_view = pitcher_stats
+    batter_stats_view  = batter_stats
+
 
 # ── Helper: metric card ───────────────────────────────────────────────────────
 def metric_card(label, value):
@@ -196,30 +228,27 @@ if view == "📊 Season Leaderboards":
     with tab_pitch:
         st.markdown('<div class="section-header">Season Pitcher Stats</div>', unsafe_allow_html=True)
 
-        # Quick KPI row
-        if len(pitcher_stats) > 0:
+        if len(pitcher_stats_view) > 0:
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                metric_card("Total Pitchers", len(pitcher_stats))
+                metric_card("Total Pitchers", len(pitcher_stats_view))
             with col2:
-                metric_card("Avg Velocity (mph)", round(pitcher_stats["AvgVelocity"].mean(), 1) if "AvgVelocity" in pitcher_stats else "—")
+                metric_card("Avg Velocity (mph)", round(pitcher_stats_view["AvgVelocity"].mean(), 1) if "AvgVelocity" in pitcher_stats_view else "—")
             with col3:
-                metric_card("Avg Spin Rate (rpm)", round(pitcher_stats["AvgSpinRate"].mean(), 0) if "AvgSpinRate" in pitcher_stats else "—")
+                metric_card("Avg Spin Rate (rpm)", round(pitcher_stats_view["AvgSpinRate"].mean(), 0) if "AvgSpinRate" in pitcher_stats_view else "—")
             with col4:
-                metric_card("Total Strikeouts", int(pitcher_stats["Strikeouts"].sum()) if "Strikeouts" in pitcher_stats else "—")
+                metric_card("Total Strikeouts", int(pitcher_stats_view["Strikeouts"].sum()) if "Strikeouts" in pitcher_stats_view else "—")
 
-        # Filter
         search = st.text_input("Search pitcher name", placeholder="e.g. Smith", key="p_search")
-        teams  = ["All"] + sorted(pitcher_stats["PitcherTeam"].dropna().unique().tolist())
+        teams  = ["All"] + sorted(pitcher_stats_view["PitcherTeam"].dropna().unique().tolist())
         team   = st.selectbox("Team", teams, key="p_team")
 
-        df = pitcher_stats.copy()
+        df = pitcher_stats_view.copy()
         if search:
             df = df[df["Pitcher"].str.contains(search, case=False, na=False)]
         if team != "All":
             df = df[df["PitcherTeam"] == team]
 
-        # Column order
         display_cols = [c for c in [
             "Pitcher", "PitcherTeam", "PitcherThrows", "TotalPitches",
             "AvgVelocity", "MaxVelocity", "AvgSpinRate",
@@ -236,30 +265,26 @@ if view == "📊 Season Leaderboards":
     with tab_bat:
         st.markdown('<div class="section-header">Season Batter Stats</div>', unsafe_allow_html=True)
 
-        if len(batter_stats) > 0:
+        if len(batter_stats_view) > 0:
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                metric_card("Total Batters", len(batter_stats))
+                metric_card("Total Batters", len(batter_stats_view))
             with col2:
-                metric_card("Avg Exit Velo (mph)", round(batter_stats["AvgExitVelo"].mean(), 1) if "AvgExitVelo" in batter_stats else "—")
+                metric_card("Avg Exit Velo (mph)", round(batter_stats_view["AvgExitVelo"].mean(), 1) if "AvgExitVelo" in batter_stats_view else "—")
             with col3:
-                metric_card("Avg Launch Angle (°)", round(batter_stats["AvgLaunchAngle"].mean(), 1) if "AvgLaunchAngle" in batter_stats else "—")
+                metric_card("Avg Launch Angle (°)", round(batter_stats_view["AvgLaunchAngle"].mean(), 1) if "AvgLaunchAngle" in batter_stats_view else "—")
             with col4:
-                metric_card("Total Home Runs", int(batter_stats["HomeRuns"].sum()) if "HomeRuns" in batter_stats else "—")
+                metric_card("Total Home Runs", int(batter_stats_view["HomeRuns"].sum()) if "HomeRuns" in batter_stats_view else "—")
 
         search_b = st.text_input("Search batter name", placeholder="e.g. Jones", key="b_search")
-        teams_b  = ["All"] + sorted(batter_stats["BatterTeam"].dropna().unique().tolist())
+        teams_b  = ["All"] + sorted(batter_stats_view["BatterTeam"].dropna().unique().tolist())
         team_b   = st.selectbox("Team", teams_b, key="b_team")
 
-        df_b = batter_stats.copy()
+        df_b = batter_stats_view.copy()
         if search_b:
             df_b = df_b[df_b["Batter"].str.contains(search_b, case=False, na=False)]
         if team_b != "All":
             df_b = df_b[df_b["BatterTeam"] == team_b]
-
-        # Compute BA-like column if possible
-        if all(c in df_b.columns for c in ["Hits", "TotalPitches"]):
-            df_b["H"] = df_b["Hits"]
 
         display_cols_b = [c for c in [
             "Batter", "BatterTeam", "BatterSide", "TotalPitches",
@@ -282,14 +307,15 @@ elif view == "🔎 Player Profile":
     profile_type = st.radio("Player type", ["Pitcher", "Batter"], horizontal=True)
 
     if profile_type == "Pitcher":
-        # Build display name list
-        names = sorted(pitcher_stats["Pitcher"].dropna().unique().tolist())
+        names = sorted(pitcher_stats_view["Pitcher"].dropna().unique().tolist())
+        if not names:
+            st.info(f"No pitcher data found for {season}.")
+            st.stop()
         selected = st.selectbox("Select pitcher", names)
 
-        p_row = pitcher_stats[pitcher_stats["Pitcher"] == selected].iloc[0]
+        p_row = pitcher_stats_view[pitcher_stats_view["Pitcher"] == selected].iloc[0]
 
-        # ── Season stats cards ──
-        st.markdown(f'<div class="section-header">📋 {selected} — Season Overview</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-header">📋 {selected} — {season_label} Overview</div>', unsafe_allow_html=True)
         col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1: metric_card("Total Pitches", int(p_row.get("TotalPitches", 0)))
         with col2: metric_card("Avg Velo", f'{p_row.get("AvgVelocity", "—")} mph')
@@ -304,35 +330,35 @@ elif view == "🔎 Player Profile":
         with col9:  metric_card("Avg Vert Break",  f'{p_row.get("AvgVertBreak", "—")} in')
         with col10: metric_card("Avg Horz Break",  f'{p_row.get("AvgHorzBreak", "—")} in')
 
-        # ── Game log ──
         st.markdown('<div class="section-header">📅 Game-by-Game Log</div>', unsafe_allow_html=True)
-        gl = pitcher_game_log[pitcher_game_log["Pitcher"] == selected].copy()
+        gl = p_log_filtered[p_log_filtered["Pitcher"] == selected].copy()
         if len(gl) == 0:
             st.info("No game log data found for this pitcher.")
         else:
             gl = gl.sort_values("GameDate")
-            display_gl = [c for c in ["GameDate", "PitcherTeam", "Pitches", "AvgVelo", "Strikeouts", "Walks", "HitsAllowed"] if c in gl.columns]
+            display_gl = [c for c in ["GameDate", "Season", "PitcherTeam", "Pitches", "AvgVelo", "Strikeouts", "Walks", "HitsAllowed"] if c in gl.columns]
             st.dataframe(gl[display_gl].reset_index(drop=True), use_container_width=True)
 
-            # Velocity trend chart
             if "AvgVelo" in gl.columns and gl["AvgVelo"].notna().any():
                 st.markdown('<div class="section-header">📈 Velocity Trend</div>', unsafe_allow_html=True)
                 chart_data = gl[["GameDate", "AvgVelo"]].dropna().set_index("GameDate")
                 st.line_chart(chart_data, color=AUBURN_ORANGE)
 
-            # Pitch / K / BB bar chart
             if all(c in gl.columns for c in ["GameDate", "Strikeouts", "Walks"]):
                 st.markdown('<div class="section-header">⚾ K vs BB by Game</div>', unsafe_allow_html=True)
                 chart_kb = gl[["GameDate", "Strikeouts", "Walks"]].set_index("GameDate")
                 st.bar_chart(chart_kb)
 
     else:  # Batter profile
-        names_b   = sorted(batter_stats["Batter"].dropna().unique().tolist())
+        names_b   = sorted(batter_stats_view["Batter"].dropna().unique().tolist())
+        if not names_b:
+            st.info(f"No batter data found for {season}.")
+            st.stop()
         selected_b = st.selectbox("Select batter", names_b)
 
-        b_row = batter_stats[batter_stats["Batter"] == selected_b].iloc[0]
+        b_row = batter_stats_view[batter_stats_view["Batter"] == selected_b].iloc[0]
 
-        st.markdown(f'<div class="section-header">📋 {selected_b} — Season Overview</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-header">📋 {selected_b} — {season_label} Overview</div>', unsafe_allow_html=True)
         col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1: metric_card("Total Pitches",  int(b_row.get("TotalPitches", 0)))
         with col2: metric_card("Hits",           int(b_row.get("Hits", 0)))
@@ -347,23 +373,20 @@ elif view == "🔎 Player Profile":
         with col9:  metric_card("Triples",         int(b_row.get("Triples", 0)))
         with col10: metric_card("Avg Launch Angle",f'{b_row.get("AvgLaunchAngle", "—")}°')
 
-        # ── Game log ──
         st.markdown('<div class="section-header">📅 Game-by-Game Log</div>', unsafe_allow_html=True)
-        gl_b = batter_game_log[batter_game_log["Batter"] == selected_b].copy()
+        gl_b = b_log_filtered[b_log_filtered["Batter"] == selected_b].copy()
         if len(gl_b) == 0:
             st.info("No game log data found for this batter.")
         else:
             gl_b = gl_b.sort_values("GameDate")
-            display_gl_b = [c for c in ["GameDate", "BatterTeam", "Pitches", "Hits", "HomeRuns", "Strikeouts", "Walks", "AvgExitVelo"] if c in gl_b.columns]
+            display_gl_b = [c for c in ["GameDate", "Season", "BatterTeam", "Pitches", "Hits", "HomeRuns", "Strikeouts", "Walks", "AvgExitVelo"] if c in gl_b.columns]
             st.dataframe(gl_b[display_gl_b].reset_index(drop=True), use_container_width=True)
 
-            # Exit velo trend
             if "AvgExitVelo" in gl_b.columns and gl_b["AvgExitVelo"].notna().any():
                 st.markdown('<div class="section-header">📈 Exit Velocity Trend</div>', unsafe_allow_html=True)
                 chart_ev = gl_b[["GameDate", "AvgExitVelo"]].dropna().set_index("GameDate")
                 st.line_chart(chart_ev, color=AUBURN_ORANGE)
 
-            # Hits / K / BB bar chart
             if all(c in gl_b.columns for c in ["GameDate", "Hits", "Strikeouts"]):
                 st.markdown('<div class="section-header">🏏 Hits vs Ks by Game</div>', unsafe_allow_html=True)
                 chart_hk = gl_b[["GameDate", "Hits", "Strikeouts"]].set_index("GameDate")
