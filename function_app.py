@@ -345,7 +345,7 @@ def run_transform():
         buf = io.StringIO()
         df.to_csv(buf, index=False)
         data = buf.getvalue().encode("utf-8")
-        proc.get_blobClient(name).upload_blob(data, overwrite=True)
+        proc.get_blob_client(name).upload_blob(data, overwrite=True)
         logging.info(f"Uploaded {name}: {len(df)} rows, {len(data):,} bytes")
 
     _upload(p_df,  "pitcher_stats.csv")
