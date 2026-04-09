@@ -176,7 +176,7 @@ if view == "📊 Season Leaderboards":
         ]
         display_cols_p = [c for c in display_cols_p if c in df_p.columns]
 
-        sort_by_p = sort_col_p if sort_col_p in df_p.columns else "TotalPitches"
+        sort_by_p = sort_col_p if sort_col_p in display_cols_p else "TotalPitches"
         df_p = df_p[display_cols_p].sort_values(sort_by_p, ascending=False)
 
         st.dataframe(df_p, use_container_width=True, hide_index=True)
@@ -218,7 +218,7 @@ if view == "📊 Season Leaderboards":
         ]
         display_cols_b = [c for c in display_cols_b if c in df_b.columns]
 
-        sort_by_b = sort_col_b if sort_col_b in df_b.columns else "AtBats"
+        sort_by_b = sort_col_b if sort_col_b in display_cols_b else "Hits"
         df_b = df_b[display_cols_b].sort_values(sort_by_b, ascending=False)
 
         st.dataframe(df_b, use_container_width=True, hide_index=True)
