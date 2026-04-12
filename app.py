@@ -180,7 +180,7 @@ if view == "📊 Season Leaderboards":
         df_p = df_p[display_cols_p].sort_values(sort_by_p, ascending=False)
 
         st.dataframe(df_p, use_container_width=True, hide_index=True)
-        st.caption(f"Showing {len(df_p)} pitchers  •  All-time aggregated stats")
+        st.caption(f"Showing {len(df_p)} pitchers  •  2026 season stats")
 
     # ── Batters ───────────────────────────────────────────────────────────────
     with tab_b:
@@ -222,7 +222,7 @@ if view == "📊 Season Leaderboards":
         df_b = df_b[display_cols_b].sort_values(sort_by_b, ascending=False)
 
         st.dataframe(df_b, use_container_width=True, hide_index=True)
-        st.caption(f"Showing {len(df_b)} batters  •  All-time aggregated stats")
+        st.caption(f"Showing {len(df_b)} batters  •  2026 season stats")
 
     # ── Pitcher Game Log ──────────────────────────────────────────────────────
     with tab_pg:
