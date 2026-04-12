@@ -11,7 +11,7 @@ import pandas as pd
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 CONN_STR = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
-RAW_CONTAINER = "raw-stats"
+RAW_CONTAINER = "raw-stats"h
 PROCESSED_CONTAINER = "processed-stats"
 
 _status = {"state": "idle", "msg": ""}
@@ -82,7 +82,7 @@ def run_transform():
     client = BlobServiceClient.from_connection_string(CONN_STR)
     raw = client.get_container_client(RAW_CONTAINER)
 
-    blobs = [b.name for b in raw.list_blobs() if is_game_csv(b.name)]
+    blobs = [b.name for b in raw.list_blobs() if is_game_csv(b.name) and "2026" in b.name]
     total = len(blobs)
     logging.info(f"Found {total} game CSV files to process")
 
