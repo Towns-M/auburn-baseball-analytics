@@ -11,7 +11,7 @@ import pandas as pd
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 CONN_STR = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
-RAW_CONTAINER = "raw-stats"h
+RAW_CONTAINER = "raw-stats"
 PROCESSED_CONTAINER = "processed-stats"
 
 _status = {"state": "idle", "msg": ""}
