@@ -9,7 +9,7 @@ import pandas as pd
 import os
 from io import BytesIO
 from azure.storage.blob import BlobServiceClient
-
+from concurrent.futures import ThreadPoolExecutor
 # ─── Config ──────────────────────────────────────────────────────────────────
 AUBURN              = "AUB_TIG"
 PROCESSED_CONTAINER = "processed-stats"
@@ -44,26 +44,35 @@ st.markdown("""
 
 
 # ─── Data loading ────────────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def load_data():
+@st.cache_resource
+def get_container():
+    """Cached Azure container client — reused across reruns."""
     conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
     if not conn_str:
+        return None
+    return (BlobServiceClient.from_connection_string(conn_str)
+            .get_container_client(PROCESSED_CONTAINER))
+
+
+@st.cache_data(ttl=3600, show_spinner="Loading Auburn data…")
+def load_data():
+    container = get_container()
+    if container is None:
         return None, None, None, None, "AZURE_STORAGE_CONNECTION_STRING not set"
     try:
-        client    = BlobServiceClient.from_connection_string(conn_str)
-        container = client.get_container_client(PROCESSED_CONTAINER)
-
         def read_csv(name):
             data = container.get_blob_client(name).download_blob().readall()
             return pd.read_csv(BytesIO(data), low_memory=False)
 
-        return (
-            read_csv("pitcher_stats.csv"),
-            read_csv("batter_stats.csv"),
-            read_csv("pitcher_game_log.csv"),
-            read_csv("batter_game_log.csv"),
-            None,
-        )
+        names = [
+            "pitcher_stats.csv",
+            "batter_stats.csv",
+            "pitcher_game_log.csv",
+            "batter_game_log.csv",
+        ]
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            ps, bs, pg, bg = list(ex.map(read_csv, names))
+        return ps, bs, pg, bg, None
     except Exception as e:
         return None, None, None, None, str(e)
 
