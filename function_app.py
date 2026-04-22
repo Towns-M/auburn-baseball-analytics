@@ -367,6 +367,61 @@ def _update_batter(acc, sub):
     acc["OutZoneSwings"]  += out_swings
 
 
+def _norm_pid(raw, name_fallback=None):
+    """Canonicalize a PitcherId / BatterId across files.
+
+    - NaN / empty  -> fall back to 'NAME::<UPPERCASE NAME>' if provided
+    - numeric-like -> int-string form ('12345.0' -> '12345')
+    - otherwise    -> stripped string
+    Returns None if the row cannot be identified at all.
+    """
+    try:
+        if pd.isna(raw):
+            if name_fallback and str(name_fallback).strip():
+                return "NAME::" + str(name_fallback).strip().upper()
+            return None
+    except Exception:
+        pass
+    s = str(raw).strip()
+    if s == "" or s.lower() == "nan":
+        if name_fallback and str(name_fallback).strip():
+            return "NAME::" + str(name_fallback).strip().upper()
+        return None
+    try:
+        return str(int(float(s)))
+    except Exception:
+        return s
+
+
+def _merge_by_name(acc_dict, name_field, team_field):
+    """Collapse accumulators that share the same (name, team) tuple.
+
+    Handles the rare case where TrackMan re-assigned an ID to the same
+    human mid-season. Numeric fields are summed; identity fields are kept
+    from the first entry seen.
+    """
+    canon = {}
+    order = []
+    for key, v in acc_dict.items():
+        ident = (str(v.get(name_field, "")).upper().strip(),
+                 str(v.get(team_field, "")).upper().strip())
+        if not ident[0]:
+            canon[key] = v
+            order.append(key)
+            continue
+        if ident not in canon:
+            canon[ident] = v
+            order.append(ident)
+        else:
+            for k, val in v.items():
+                cur = canon[ident].get(k)
+                if isinstance(val, (int, float)) and isinstance(cur, (int, float)):
+                    canon[ident][k] = cur + val
+    # Return a dict keyed by unique string keys so downstream code is unchanged.
+    out = {}
+    for i, k in enumerate(order):
+        out[f"{i}"] = canon[k]
+    return out
 # ═════════════════════════════════════════════════════════════════════════════
 # Main transform
 # ═════════════════════════════════════════════════════════════════════════════
@@ -417,7 +472,12 @@ def run_transform():
             # ─── Pitcher aggregation ────────────────────────────────────────
             if "PitcherId" in df.columns:
                 for pid, sub in df.groupby("PitcherId", dropna=False):
-                    key = str(pid)
+                    name_hint = None
+                    if "Pitcher" in sub.columns and sub["Pitcher"].notna().any():
+                        name_hint = sub["Pitcher"].dropna().iloc[0]
+                    key = _norm_pid(pid, name_fallback=name_hint)
+                    if key is None:
+                        continue  # skip truly unidentifiable pitches
                     acc = pitch_acc.setdefault(key, _init_pitcher_acc())
 
                     # Identity — latest non-empty wins (stable for single-team players)
@@ -461,8 +521,12 @@ def run_transform():
             pa_cols = ["PitcherId", "BatterId", "Inning", "Top/Bottom"]
             if all(c in df.columns for c in pa_cols):
                 for pa_keys, pa_pitches in df.groupby(pa_cols, dropna=False):
-                    pid = str(pa_keys[0])
-                    if pid not in pitch_acc:
+                    # Use the same normalization so we hit the real accumulator
+                    name_hint = None
+                    if "Pitcher" in pa_pitches.columns and pa_pitches["Pitcher"].notna().any():
+                        name_hint = pa_pitches["Pitcher"].dropna().iloc[0]
+                    pid = _norm_pid(pa_keys[0], name_fallback=name_hint)
+                    if pid is None or pid not in pitch_acc:
                         continue
                     # Only count PAs that actually ended (ignore interrupted innings)
                     if not bool(pa_pitches["_pa_end"].any()):
@@ -473,7 +537,12 @@ def run_transform():
             # ─── Batter aggregation ─────────────────────────────────────────
             if "BatterId" in df.columns:
                 for bid, sub in df.groupby("BatterId", dropna=False):
-                    key = str(bid)
+                    name_hint = None
+                    if "Batter" in sub.columns and sub["Batter"].notna().any():
+                        name_hint = sub["Batter"].dropna().iloc[0]
+                    key = _norm_pid(bid, name_fallback=name_hint)
+                    if key is None:
+                        continue
                     acc = bat_acc.setdefault(key, _init_batter_acc())
 
                     for field, col in [("Batter", "Batter"),
@@ -532,6 +601,9 @@ def run_transform():
 
     # ═══════════════════════════════════════════════════════════════════════
     # Build pitcher_stats.csv
+    # Collapse same-player duplicates that slipped through with different IDs
+    pitch_acc = _merge_by_name(pitch_acc, "Pitcher", "PitcherTeam")
+    bat_acc   = _merge_by_name(bat_acc,   "Batter",  "BatterTeam")
     # ═══════════════════════════════════════════════════════════════════════
     p_rows = []
     for pid, a in pitch_acc.items():
