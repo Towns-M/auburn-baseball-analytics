@@ -19,17 +19,22 @@ import re
 import threading as _threading
 from collections import Counter
 
+
 from azure.storage.blob import BlobServiceClient
 import pandas as pd
 
+
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+
 
 CONN_STR = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
 RAW_CONTAINER = "raw-stats"
 PROCESSED_CONTAINER = "processed-stats"
 SEASON = "2026"
 
+
 _status = {"state": "idle", "msg": ""}
+
 
 # ─── Columns we read from raw CSVs ───────────────────────────────────────────
 KEEP_COLS = {
@@ -41,7 +46,11 @@ KEEP_COLS = {
     "TaggedHitType", "PlayResult", "KorBB", "PitchCall",
     "ExitSpeed", "Angle", "Direction", "Distance",
     "PitcherSet", "HomeTeam", "AwayTeam",
+    # Needed for cross-file pitch deduplication (TrackMan publishes each
+    # game twice — live and "_v3" verified — and both pass is_game_csv).
+    "GameUID", "PitchUID",
 }
+
 
 # ─── Pitch-type normalisation ────────────────────────────────────────────────
 PITCH_TYPE_MAP = {
@@ -59,19 +68,23 @@ PITCH_TYPE_MAP = {
 }
 PITCH_BUCKETS = ["FB", "SI", "CT", "SL", "CB", "CH", "SP", "KN"]
 
+
 # ─── Strike-zone geometry (standard MLB zone, height-averaged) ───────────────
 ZONE_LEFT, ZONE_RIGHT = -0.83, 0.83       # ft from center of plate
 ZONE_BOTTOM, ZONE_TOP = 1.5, 3.5          # ft off the ground
 EDGE_BAND = 0.15                          # "edge" = within 0.15 ft of zone boundary (inside)
 
+
 # ─── PitchCall sets ──────────────────────────────────────────────────────────
 STRIKE_PITCHCALLS = {"StrikeCalled", "StrikeSwinging", "FoulBall", "InPlay"}
 SWING_PITCHCALLS  = {"StrikeSwinging", "FoulBall", "InPlay"}
+
 
 # ─── PlayResult sets ─────────────────────────────────────────────────────────
 BATTER_OUT_RESULTS = {"Out", "FieldersChoice", "Sacrifice", "SacrificeFly"}
 AB_OUT_RESULTS     = {"Out", "FieldersChoice", "Error"}  # "Sacrifice*" don't count as at-bats
 HIT_RESULTS        = {"Single", "Double", "Triple", "HomeRun"}
+
 
 # ─── Hit-type buckets (for GB%, LD%, FB%, PU%) ───────────────────────────────
 GB_TYPES = {"groundball"}
@@ -79,8 +92,11 @@ LD_TYPES = {"linedrive"}
 FB_TYPES = {"flyball"}
 PU_TYPES = {"popup", "pop-up", "popfly"}
 
+
 # File-name filter: accept only "real" game CSVs in 2026 with an 8-digit date path
 GAME_DATE_RE = re.compile(r"(20\d{2})(\d{2})(\d{2})")
+
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -98,6 +114,8 @@ def is_game_csv(blob_name: str, season: str = SEASON) -> bool:
     return m.group(1) == season
 
 
+
+
 def _get_opponent(team: str, home: str, away: str) -> str:
     if not home or not away:
         return ""
@@ -109,10 +127,13 @@ def _get_opponent(team: str, home: str, away: str) -> str:
     return ""
 
 
+
+
 def _annotate_pitch_flags(df: pd.DataFrame) -> pd.DataFrame:
     """Add derived boolean/categorical columns used across all aggregations."""
     if len(df) == 0:
         return df
+
 
     # Plate location → in-zone / on-edge
     pls = pd.to_numeric(df.get("PlateLocSide"),  errors="coerce") if "PlateLocSide"  in df else pd.Series(dtype=float)
@@ -131,11 +152,13 @@ def _annotate_pitch_flags(df: pd.DataFrame) -> pd.DataFrame:
         df["_on_edge"] = False
         df["_has_loc"] = False
 
+
     # Pitch outcomes
     pc = df.get("PitchCall", pd.Series([""] * len(df))).fillna("").astype(str)
     df["_is_strike"] = pc.isin(STRIKE_PITCHCALLS)
     df["_is_swing"]  = pc.isin(SWING_PITCHCALLS)
     df["_is_hbp"]    = (pc == "HitByPitch")
+
 
     # First pitch of PA (Balls==0 AND Strikes==0 before the pitch)
     if "Balls" in df.columns and "Strikes" in df.columns:
@@ -147,6 +170,7 @@ def _annotate_pitch_flags(df: pd.DataFrame) -> pd.DataFrame:
         df["_is_first_pitch"] = False
         df["_at_1_2"]        = False
 
+
     # PA-ending pitch
     korbb = df.get("KorBB",     pd.Series([""] * len(df))).fillna("").astype(str)
     pr    = df.get("PlayResult", pd.Series([""] * len(df))).fillna("").astype(str)
@@ -156,6 +180,7 @@ def _annotate_pitch_flags(df: pd.DataFrame) -> pd.DataFrame:
         (~pr.isin(["", "Undefined"]))
     )
 
+
     # Hit-type bucket
     tht = df.get("TaggedHitType", pd.Series([""] * len(df))).fillna("").astype(str).str.lower()
     df["_ht_gb"] = tht.isin(GB_TYPES)
@@ -164,7 +189,10 @@ def _annotate_pitch_flags(df: pd.DataFrame) -> pd.DataFrame:
     df["_ht_pu"] = tht.isin(PU_TYPES)
     df["_bip"]   = df["_ht_gb"] | df["_ht_ld"] | df["_ht_fb"] | df["_ht_pu"]
 
+
     return df
+
+
 
 
 def _pa_wins_for_pitcher(pa_pitches: pd.DataFrame) -> int:
@@ -175,6 +203,8 @@ def _pa_wins_for_pitcher(pa_pitches: pd.DataFrame) -> int:
     pr_last    = str(last.get("PlayResult") or "")
     retired = korbb_last == "Strikeout" or pr_last in BATTER_OUT_RESULTS
     return int(any_1_2 or retired)
+
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -205,6 +235,8 @@ def _init_pitcher_acc():
     }
 
 
+
+
 def _init_batter_acc():
     return {
         "Batter": "", "BatterTeam": "", "BatterSide": "",
@@ -221,11 +253,14 @@ def _init_batter_acc():
     }
 
 
+
+
 def _update_pitcher(acc, sub, file_home, file_away):
     """Roll one file's worth of a pitcher's pitches into the accumulator."""
     n = len(sub)
     if n == 0:
         return
+
 
     # Velocity / stuff
     velos = pd.to_numeric(sub.get("RelSpeed"),        errors="coerce").dropna()
@@ -233,9 +268,11 @@ def _update_pitcher(acc, sub, file_home, file_away):
     ivb   = pd.to_numeric(sub.get("InducedVertBreak"), errors="coerce").dropna()
     hb    = pd.to_numeric(sub.get("HorzBreak"),       errors="coerce").dropna()
 
+
     # Outcome counts (per pitch where PA terminates)
     korbb = sub.get("KorBB",      pd.Series([""] * n)).fillna("").astype(str)
     pr    = sub.get("PlayResult", pd.Series([""] * n)).fillna("").astype(str)
+
 
     ks   = int((korbb == "Strikeout").sum())
     bbs  = int((korbb == "Walk").sum())
@@ -243,8 +280,10 @@ def _update_pitcher(acc, sub, file_home, file_away):
     hits = int(pr.isin(HIT_RESULTS).sum())
     hrs  = int((pr == "HomeRun").sum())
 
+
     outs_in_play = int(pr.isin(["Out", "FieldersChoice", "Error", "Sacrifice", "SacrificeFly"]).sum())
     outs_rec     = ks + outs_in_play
+
 
     # Pitch-type buckets
     pt_counts = Counter()
@@ -253,14 +292,17 @@ def _update_pitcher(acc, sub, file_home, file_away):
         if bucket:
             pt_counts[bucket] += 1
 
+
     # First-pitch strikes
     first_pitches       = int(sub["_is_first_pitch"].sum())
     first_pitch_strikes = int((sub["_is_first_pitch"] & sub["_is_strike"]).sum())
+
 
     # Edge / in-zone (only count pitches with valid location data)
     located     = int(sub["_has_loc"].sum())
     in_zone     = int((sub["_in_zone"] & sub["_has_loc"]).sum())
     on_edge     = int((sub["_on_edge"] & sub["_has_loc"]).sum())
+
 
     # Batted ball
     bip = int(sub["_bip"].sum())
@@ -269,8 +311,10 @@ def _update_pitcher(acc, sub, file_home, file_away):
     fb  = int(sub["_ht_fb"].sum())
     pu  = int(sub["_ht_pu"].sum())
 
+
     # BF = number of PA-terminating pitches
     bf = int(sub["_pa_end"].sum())
+
 
     # Accumulate
     acc["TotalPitches"] += n
@@ -286,6 +330,7 @@ def _update_pitcher(acc, sub, file_home, file_away):
     acc["HBSum"]        += float(hb.sum())
     acc["HBCount"]      += len(hb)
 
+
     acc["Strikeouts"]   += ks
     acc["Walks"]        += bbs
     acc["HBP"]          += hbp
@@ -293,11 +338,13 @@ def _update_pitcher(acc, sub, file_home, file_away):
     acc["HRsAllowed"]   += hrs
     acc["OutsRecorded"] += outs_rec
 
+
     acc["FirstPitches"]        += first_pitches
     acc["FirstPitchStrikes"]   += first_pitch_strikes
     acc["LocatedPitches"]      += located
     acc["InZonePitches"]       += in_zone
     acc["EdgePitches"]         += on_edge
+
 
     acc["BIP"] += bip
     acc["GB"]  += gb
@@ -305,8 +352,11 @@ def _update_pitcher(acc, sub, file_home, file_away):
     acc["FB"]  += fb
     acc["PU"]  += pu
 
+
     for b in PITCH_BUCKETS:
         acc[f"{b}_Count"] += pt_counts.get(b, 0)
+
+
 
 
 def _update_batter(acc, sub):
@@ -314,11 +364,14 @@ def _update_batter(acc, sub):
     if n == 0:
         return
 
+
     evs = pd.to_numeric(sub.get("ExitSpeed"), errors="coerce").dropna()
     las = pd.to_numeric(sub.get("Angle"),     errors="coerce").dropna()
 
+
     korbb = sub.get("KorBB",      pd.Series([""] * n)).fillna("").astype(str)
     pr    = sub.get("PlayResult", pd.Series([""] * n)).fillna("").astype(str)
+
 
     ks      = int((korbb == "Strikeout").sum())
     bbs     = int((korbb == "Walk").sum())
@@ -328,11 +381,14 @@ def _update_batter(acc, sub):
     triples = int((pr == "Triple").sum())
     hrs     = int((pr == "HomeRun").sum())
 
+
     in_play_outs = int(pr.isin(AB_OUT_RESULTS).sum())
     at_bats      = ks + singles + doubles + triples + hrs + in_play_outs
     total_bases  = singles + 2*doubles + 3*triples + 4*hrs
 
+
     pa_total = int(sub["_pa_end"].sum())
+
 
     # Zone discipline
     located     = int(sub["_has_loc"].sum())
@@ -340,6 +396,7 @@ def _update_batter(acc, sub):
     out_zone    = int((~sub["_in_zone"] & sub["_has_loc"]).sum())
     in_swings   = int((sub["_in_zone"]  & sub["_has_loc"] & sub["_is_swing"]).sum())
     out_swings  = int((~sub["_in_zone"] & sub["_has_loc"] & sub["_is_swing"]).sum())
+
 
     acc["TotalPitches"] += n
     acc["PA"]           += pa_total
@@ -353,6 +410,7 @@ def _update_batter(acc, sub):
     acc["HomeRuns"]     += hrs
     acc["TotalBases"]   += total_bases
 
+
     acc["EVSum"]   += float(evs.sum())
     acc["EVCount"] += len(evs)
     if len(evs):
@@ -360,11 +418,14 @@ def _update_batter(acc, sub):
     acc["LASum"]   += float(las.sum())
     acc["LACount"] += len(las)
 
+
     acc["LocatedPitches"] += located
     acc["InZonePitches"]  += in_zone
     acc["OutZonePitches"] += out_zone
     acc["InZoneSwings"]   += in_swings
     acc["OutZoneSwings"]  += out_swings
+
+
 
 
 def _norm_pid(raw, name_fallback=None):
@@ -391,6 +452,8 @@ def _norm_pid(raw, name_fallback=None):
         return str(int(float(s)))
     except Exception:
         return s
+
+
 
 
 def _merge_by_name(acc_dict, name_field, team_field):
@@ -429,12 +492,15 @@ def run_transform():
     if not CONN_STR:
         raise ValueError("AZURE_STORAGE_CONNECTION_STRING is not set")
 
+
     client = BlobServiceClient.from_connection_string(CONN_STR)
     raw    = client.get_container_client(RAW_CONTAINER)
+
 
     blobs = [b.name for b in raw.list_blobs() if is_game_csv(b.name)]
     total = len(blobs)
     logging.info(f"Found {total} game CSV files for {SEASON}")
+
 
     # Accumulators keyed by player ID string
     pitch_acc = {}   # key = str(PitcherId)
@@ -442,7 +508,10 @@ def run_transform():
     pitch_game_rows = []
     bat_game_rows   = []
 
+
     errors = 0
+    seen_pitch_keys: set = set()   # cross-file pitch dedup (see below)
+    dup_pitches_dropped = 0
     for i, blob_name in enumerate(blobs):
         try:
             raw_bytes = raw.get_blob_client(blob_name).download_blob().readall()
@@ -454,20 +523,53 @@ def run_transform():
             if len(df) == 0:
                 continue
 
+
+            # ─── Cross-file pitch dedup ─────────────────────────────────
+            # TrackMan publishes most games twice (live "<gameID>.csv" +
+            # verified "<gameID>_v3.csv"). Both pass is_game_csv() and
+            # contain identical pitch rows. Without this, every pitch in
+            # such a game is counted twice, roughly doubling every pitcher
+            # and batter season total.
+            if "PitchUID" in df.columns and df["PitchUID"].notna().any():
+                key_col = df["PitchUID"].fillna("").astype(str)
+            elif {"GameUID", "PitchNo"}.issubset(df.columns):
+                key_col = (df["GameUID"].fillna("").astype(str)
+                           + "::" + df["PitchNo"].astype(str))
+            else:
+                key_col = None
+
+            if key_col is not None:
+                mask = (~key_col.isin(seen_pitch_keys)) & (key_col != "")
+                dropped = int((~mask).sum())
+                if dropped:
+                    dup_pitches_dropped += dropped
+                    logging.info(
+                        f"  dedup: dropped {dropped}/{len(df)} duplicate pitches from {blob_name}"
+                    )
+                df = df.loc[mask].reset_index(drop=True)
+                if len(df) == 0:
+                    continue
+                seen_pitch_keys.update(key_col[mask].tolist())
+
+
             # Deterministic order within the file
             if "PitchNo" in df.columns:
                 df = df.sort_values("PitchNo", kind="mergesort").reset_index(drop=True)
 
+
             df = _annotate_pitch_flags(df)
+
 
             # Date from blob path
             m = GAME_DATE_RE.search(blob_name)
             game_date = m.group(1) + m.group(2) + m.group(3) if m else "unknown"
 
+
             # Home / away
             file_home = str(df["HomeTeam"].dropna().iloc[0]).strip() if "HomeTeam" in df.columns and df["HomeTeam"].notna().any() else ""
             file_away = str(df["AwayTeam"].dropna().iloc[0]).strip() if "AwayTeam" in df.columns and df["AwayTeam"].notna().any() else ""
             is_game   = file_home and file_away and file_home.upper() != file_away.upper()
+
 
             # ─── Pitcher aggregation ────────────────────────────────────────
             if "PitcherId" in df.columns:
@@ -480,6 +582,7 @@ def run_transform():
                         continue  # skip truly unidentifiable pitches
                     acc = pitch_acc.setdefault(key, _init_pitcher_acc())
 
+
                     # Identity — latest non-empty wins (stable for single-team players)
                     for field, col in [("Pitcher", "Pitcher"),
                                         ("PitcherTeam", "PitcherTeam"),
@@ -489,7 +592,9 @@ def run_transform():
                             if len(s):
                                 acc[field] = str(s.iloc[0]).strip()
 
+
                     _update_pitcher(acc, sub, file_home, file_away)
+
 
                     # Game log row
                     if is_game:
@@ -501,6 +606,7 @@ def run_transform():
                             ["Out", "FieldersChoice", "Error", "Sacrifice", "SacrificeFly"]
                         ).sum())
                         bf_game = int(sub["_pa_end"].sum())
+
 
                         pitch_game_rows.append({
                             "PitcherId":   key,
@@ -516,6 +622,7 @@ def run_transform():
                             "HitsAllowed": hits,
                             "OutsRecorded": ks + outs_in_play,
                         })
+
 
             # ─── Per-PA Win% (pitcher perspective) ───────────────────────────
             pa_cols = ["PitcherId", "BatterId", "Inning", "Top/Bottom"]
@@ -534,6 +641,7 @@ def run_transform():
                     pitch_acc[pid]["PATotal"] += 1
                     pitch_acc[pid]["PAWins"]  += _pa_wins_for_pitcher(pa_pitches)
 
+
             # ─── Batter aggregation ─────────────────────────────────────────
             if "BatterId" in df.columns:
                 for bid, sub in df.groupby("BatterId", dropna=False):
@@ -545,6 +653,7 @@ def run_transform():
                         continue
                     acc = bat_acc.setdefault(key, _init_batter_acc())
 
+
                     for field, col in [("Batter", "Batter"),
                                         ("BatterTeam", "BatterTeam"),
                                         ("BatterSide", "BatterSide")]:
@@ -553,7 +662,9 @@ def run_transform():
                             if len(s):
                                 acc[field] = str(s.iloc[0]).strip()
 
+
                     _update_batter(acc, sub)
+
 
                     if is_game:
                         evs = pd.to_numeric(sub.get("ExitSpeed"), errors="coerce").dropna()
@@ -567,6 +678,7 @@ def run_transform():
                         hrs     = int((pr == "HomeRun").sum())
                         in_play_outs = int(pr.isin(AB_OUT_RESULTS).sum())
                         at_bats      = ks + singles + doubles + triples + hrs + in_play_outs
+
 
                         bat_game_rows.append({
                             "BatterId":   key,
@@ -589,15 +701,22 @@ def run_transform():
                             "AvgExitVelo": round(float(evs.mean()), 2) if len(evs) else None,
                         })
 
+
         except Exception as e:
             logging.warning(f"Skipping {blob_name}: {e}")
             errors += 1
+
 
         if (i + 1) % 200 == 0:
             logging.info(f"Progress: {i+1}/{total} files, {errors} errors, "
                          f"{len(pitch_acc)} pitchers, {len(bat_acc)} batters")
 
-    logging.info(f"Done reading. {errors} errors. Building output DataFrames...")
+
+    logging.info(
+        f"Done reading. {errors} errors, {dup_pitches_dropped} duplicate pitches dropped. "
+        f"Building output DataFrames..."
+    )
+
 
     # ═══════════════════════════════════════════════════════════════════════
     # Build pitcher_stats.csv
@@ -610,8 +729,10 @@ def run_transform():
         p_rows.append({"PitcherId": pid, **a})
     p_df = pd.DataFrame(p_rows)
 
+
     if len(p_df):
         safe = lambda num, den: (num / den.replace(0, float("nan")))
+
 
         p_df["IP"]           = (p_df["OutsRecorded"] / 3).round(1)
         p_df["AvgVelocity"]  = (safe(p_df["VeloSum"], p_df["VeloCount"])).round(2)
@@ -619,6 +740,7 @@ def run_transform():
         p_df["AvgSpinRate"]  = (safe(p_df["SpinSum"], p_df["SpinCount"])).round(1)
         p_df["AvgIVB"]       = (safe(p_df["IVBSum"],  p_df["IVBCount"])).round(2)
         p_df["AvgIHB"]       = (safe(p_df["HBSum"],   p_df["HBCount"])).round(2)
+
 
         # Baseball-correct rate stats — use BF / PA denominators
         p_df["K_pct"]        = (safe(p_df["Strikeouts"], p_df["BF"]) * 100).round(1)
@@ -632,9 +754,11 @@ def run_transform():
         p_df["FB_pct"]       = (safe(p_df["FB"], p_df["BIP"]) * 100).round(1)
         p_df["PU_pct"]       = (safe(p_df["PU"], p_df["BIP"]) * 100).round(1)
 
+
         # Pitch-mix percentages
         for b in PITCH_BUCKETS:
             p_df[f"{b}Mix_pct"] = (safe(p_df[f"{b}_Count"], p_df["TotalPitches"]) * 100).round(1)
+
 
         drop_cols = (
             ["VeloSum","VeloCount","VeloMax","SpinSum","SpinCount",
@@ -644,6 +768,7 @@ def run_transform():
             + [f"{b}_Count" for b in PITCH_BUCKETS]
         )
         p_df = p_df.drop(columns=[c for c in drop_cols if c in p_df.columns])
+
 
         # Column order for readability
         lead = ["PitcherId", "Pitcher", "PitcherTeam", "PitcherThrows",
@@ -656,6 +781,7 @@ def run_transform():
         rest = [c for c in p_df.columns if c not in lead]
         p_df = p_df[[c for c in lead if c in p_df.columns] + rest]
 
+
     # ═══════════════════════════════════════════════════════════════════════
     # Build batter_stats.csv
     # ═══════════════════════════════════════════════════════════════════════
@@ -664,8 +790,10 @@ def run_transform():
         b_rows.append({"BatterId": bid, **a})
     b_df = pd.DataFrame(b_rows)
 
+
     if len(b_df):
         safe = lambda num, den: (num / den.replace(0, float("nan")))
+
 
         b_df["Hits"]          = b_df["Singles"] + b_df["Doubles"] + b_df["Triples"] + b_df["HomeRuns"]
         b_df["AvgExitVelo"]   = (safe(b_df["EVSum"], b_df["EVCount"])).round(2)
@@ -679,19 +807,23 @@ def run_transform():
         b_df["SLG"]           = (safe(b_df["TotalBases"], b_df["AtBats"])).round(3)
         b_df["OPS"]           = (b_df["OBP"] + b_df["SLG"]).round(3)
 
+
         # PA-based rate stats
         b_df["K_pct"]         = (safe(b_df["Strikeouts"], b_df["PA"]) * 100).round(1)
         b_df["BB_pct"]        = (safe(b_df["Walks"],      b_df["PA"]) * 100).round(1)
 
+
         # Plate discipline
         b_df["ZSwing_pct"]    = (safe(b_df["InZoneSwings"],  b_df["InZonePitches"])  * 100).round(1)
         b_df["Chase_pct"]     = (safe(b_df["OutZoneSwings"], b_df["OutZonePitches"]) * 100).round(1)
+
 
         b_df = b_df.drop(columns=["EVSum","EVCount","EVMax","LASum","LACount",
                                     "InZoneSwings","InZonePitches",
                                     "OutZoneSwings","OutZonePitches",
                                     "LocatedPitches"],
                           errors="ignore")
+
 
         lead = ["BatterId", "Batter", "BatterTeam", "BatterSide",
                 "TotalPitches", "PA", "AtBats",
@@ -703,19 +835,23 @@ def run_transform():
         rest = [c for c in b_df.columns if c not in lead]
         b_df = b_df[[c for c in lead if c in b_df.columns] + rest]
 
+
     # ═══════════════════════════════════════════════════════════════════════
     # Game logs
     # ═══════════════════════════════════════════════════════════════════════
     pg_df = pd.DataFrame(pitch_game_rows) if pitch_game_rows else pd.DataFrame()
     bg_df = pd.DataFrame(bat_game_rows)   if bat_game_rows   else pd.DataFrame()
 
+
     if not pg_df.empty and "OutsRecorded" in pg_df.columns:
         pg_df["IP"] = (pg_df["OutsRecorded"] / 3).round(1)
+
 
     # ═══════════════════════════════════════════════════════════════════════
     # Upload
     # ═══════════════════════════════════════════════════════════════════════
     proc = client.get_container_client(PROCESSED_CONTAINER)
+
 
     def _upload(df, name):
         if df.empty:
@@ -727,12 +863,16 @@ def run_transform():
         proc.get_blob_client(name).upload_blob(data, overwrite=True)
         logging.info(f"Uploaded {name}: {len(df)} rows, {len(data):,} bytes")
 
+
     _upload(p_df,  "pitcher_stats.csv")
     _upload(b_df,  "batter_stats.csv")
     _upload(pg_df, "pitcher_game_log.csv")
     _upload(bg_df, "batter_game_log.csv")
 
+
     return p_df, b_df
+
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -743,6 +883,7 @@ def transform(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("Auburn Baseball Transform triggered.")
     if _status["state"] == "running":
         return func.HttpResponse("Transform already running", status_code=200)
+
 
     def _run():
         _status["state"] = "running"
@@ -756,8 +897,11 @@ def transform(req: func.HttpRequest) -> func.HttpResponse:
         finally:
             _status["state"] = "idle"
 
+
     _threading.Thread(target=_run, daemon=True).start()
     return func.HttpResponse("Transform started", status_code=202)
+
+
 
 
 @app.route(route="status", methods=["GET"])
