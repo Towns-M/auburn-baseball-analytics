@@ -15,6 +15,7 @@ import azure.functions as func
 import logging
 import os
 import io
+import ftplib
 import re
 import threading as _threading
 from collections import Counter
@@ -31,7 +32,10 @@ CONN_STR = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
 RAW_CONTAINER = "raw-stats"
 PROCESSED_CONTAINER = "processed-stats"
 SEASON = "2026"
-
+FTP_HOST = os.environ.get("FTP_HOST", "")
+FTP_USER = os.environ.get("FTP_USER", "")
+FTP_PASS = os.environ.get("FTP_PASS", "")
+FTP_ROOT = os.environ.get("FTP_ROOT", "/v3")
 
 _status = {"state": "idle", "msg": ""}
 
@@ -907,3 +911,158 @@ def transform(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="status", methods=["GET"])
 def status(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(f"{_status['state']}: {_status['msg']}", status_code=200)
+def _walk_ftp(ftp, path, files):
+    """Recursively walk an FTP directory tree, collecting .csv file paths."""
+    try:
+        entries = []
+        ftp.retrlines("LIST " + path, entries.append)
+        for e in entries:
+            parts = e.split(None, 8)
+            if len(parts) < 9:
+                continue
+            name = parts[8]
+            if name in (".", ".."):
+                continue
+            full = path.rstrip("/") + "/" + name
+            if parts[0].startswith("d"):
+                _walk_ftp(ftp, full, files)
+            elif name.lower().endswith(".csv"):
+                files.append(full)
+    except Exception as ex:
+        logging.warning(f"FTP walk error at {path}: {ex}")
+ 
+ 
+def run_ftp_ingest():
+    """Pull new TrackMan CSVs from FTP into the raw-stats blob container.
+ 
+    Returns (uploaded, errors, skipped).
+    """
+    if not (FTP_HOST and FTP_USER and FTP_PASS):
+        raise ValueError(
+            "FTP_HOST / FTP_USER / FTP_PASS environment variables are not set"
+        )
+    if not CONN_STR:
+        raise ValueError("AZURE_STORAGE_CONNECTION_STRING is not set")
+ 
+    blob_client = BlobServiceClient.from_connection_string(CONN_STR)
+    container_client = blob_client.get_container_client(RAW_CONTAINER)
+ 
+    logging.info("Listing existing blobs in raw-stats...")
+    existing = {b.name for b in container_client.list_blobs()}
+    logging.info(f"Found {len(existing)} existing blobs")
+ 
+    logging.info(f"Connecting to FTP at {FTP_HOST}...")
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, 21, timeout=30)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.set_pasv(True)
+    logging.info(f"FTP connected. Walking {FTP_ROOT} for CSV files...")
+ 
+    all_ftp_files = []
+    _walk_ftp(ftp, FTP_ROOT, all_ftp_files)
+    logging.info(f"Total FTP CSV files found: {len(all_ftp_files)}")
+ 
+    to_upload = []
+    for ftp_path in all_ftp_files:
+        blob_name = ftp_path[len(FTP_ROOT) + 1:]   # strip leading /v3/
+        if blob_name not in existing:
+            to_upload.append((ftp_path, blob_name))
+ 
+    logging.info(f"New files to upload: {len(to_upload)}")
+ 
+    uploaded = 0
+    errors = 0
+    for ftp_path, blob_name in to_upload:
+        try:
+            buf = io.BytesIO()
+            ftp.retrbinary("RETR " + ftp_path, buf.write)
+            buf.seek(0)
+            container_client.upload_blob(name=blob_name, data=buf, overwrite=False)
+            uploaded += 1
+            if uploaded % 500 == 0:
+                logging.info(f"Uploaded {uploaded}/{len(to_upload)}...")
+        except Exception as ex:
+            logging.warning(f"Failed {ftp_path}: {ex}")
+            errors += 1
+ 
+    try:
+        ftp.quit()
+    except Exception:
+        pass
+ 
+    skipped = len(all_ftp_files) - len(to_upload)
+    logging.info(
+        f"DONE. Uploaded: {uploaded}, Errors: {errors}, "
+        f"Already-present (skipped): {skipped}"
+    )
+    return uploaded, errors, skipped
+ 
+ 
+# ═════════════════════════════════════════════════════════════════════════════
+# Nightly timer trigger — runs at 2:00 AM Central every day
+# (set WEBSITE_TIME_ZONE = "Central Standard Time" in Function App settings)
+# ═════════════════════════════════════════════════════════════════════════════
+@app.timer_trigger(
+    schedule="0 0 2 * * *",
+    arg_name="myTimer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+def nightly_ingest_and_transform(myTimer: func.TimerRequest) -> None:
+    """FTP ingest, then stats transform. Runs every night at 2 AM Central."""
+    if myTimer.past_due:
+        logging.warning("Nightly timer fired past-due.")
+ 
+    logging.info("=== Nightly run starting ===")
+ 
+    # Step 1 — FTP ingest
+    try:
+        uploaded, errors, skipped = run_ftp_ingest()
+        logging.info(
+            f"Ingest done. Uploaded={uploaded} Errors={errors} Skipped={skipped}"
+        )
+    except Exception as e:
+        logging.error(f"FTP ingest failed: {e}", exc_info=True)
+        # Continue to transform anyway — there may be earlier-day files to process
+ 
+    # Step 2 — stats transform
+    try:
+        p, b = run_transform()
+        logging.info(f"Transform done. Pitchers={len(p)} Batters={len(b)}")
+    except Exception as e:
+        logging.error(f"Transform failed: {e}", exc_info=True)
+ 
+    logging.info("=== Nightly run finished ===")
+ 
+ 
+# ═════════════════════════════════════════════════════════════════════════════
+# Manual trigger — hit this URL anytime to run ingest + transform on demand
+#   POST/GET https://<funcapp>.azurewebsites.net/api/ingest?code=<function-key>
+# ═════════════════════════════════════════════════════════════════════════════
+@app.route(route="ingest", methods=["GET", "POST"])
+def manual_ingest(req: func.HttpRequest) -> func.HttpResponse:
+    """Manually trigger the nightly run. Returns immediately;
+    work continues in a background thread (same pattern as /transform)."""
+    if _status["state"] == "running":
+        return func.HttpResponse("Pipeline already running", status_code=200)
+ 
+    def _run():
+        _status["state"] = "running"
+        _status["msg"] = "ingest running"
+        try:
+            uploaded, errors, skipped = run_ftp_ingest()
+            _status["msg"] = (
+                f"ingest OK uploaded={uploaded} errors={errors}; running transform..."
+            )
+            p, b = run_transform()
+            _status["msg"] = (
+                f"OK uploaded={uploaded} pitchers={len(p)} batters={len(b)}"
+            )
+        except Exception as e:
+            logging.error(f"Manual ingest failed: {e}", exc_info=True)
+            _status["msg"] = f"ERROR: {e}"
+        finally:
+            _status["state"] = "idle"
+ 
+    _threading.Thread(target=_run, daemon=True).start()
+    return func.HttpResponse("Nightly run started", status_code=202)
